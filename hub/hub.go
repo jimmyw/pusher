@@ -1,7 +1,6 @@
 package hub
 
 import (
-	"code.google.com/p/go.net/websocket"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,16 +10,19 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"code.google.com/p/go.net/websocket"
 )
 
 const (
-	defaultBufferSize     = 1024
-	defaultHeartbeat      = time.Second * 5
-	defaultSessionTimeout = time.Second * 30
-	idLength              = 16
-	bufLength             = 4096
-	defaultLoglevel       = 1
+	defaultBufferSize         = 128
+	defaultHeartbeat          = time.Second * 60
+	defaultHeartbeatGracetime = time.Second * 5
+	defaultSessionTimeout     = time.Second * 180
+	idLength                  = 16
+	defaultLoglevel           = 1
 )
 
 func init() {
@@ -38,30 +40,66 @@ func prettify(obj interface{}) string {
 }
 
 type Server struct {
-	heartbeat      time.Duration
-	sessionTimeout time.Duration
-	sessions       map[string]*Session
-	subscriptions  map[string]map[string]*Session
-	subscribers    map[string]map[string]bool
-	lock           *sync.RWMutex
-	loglevel       int
-	bufferSize     int
-	logger         *log.Logger
-	authorizer     Authorizer
+	heartbeat          time.Duration
+	heartbeatGracetime time.Duration
+	sessionTimeout     time.Duration
+	sessions           map[string]*Session
+	subscriptions      map[string]map[string]*Session
+	subscribers        map[string]map[string]bool
+	lock               *sync.RWMutex
+	loglevel           int
+	bufferSize         int
+	logger             *log.Logger
+	authorizer         Authorizer
 }
 
 func NewServer() *Server {
 	return &Server{
-		heartbeat:      defaultHeartbeat,
-		bufferSize:     defaultBufferSize,
-		sessionTimeout: defaultSessionTimeout,
-		loglevel:       defaultLoglevel,
-		sessions:       map[string]*Session{},
-		subscriptions:  map[string]map[string]*Session{},
-		subscribers:    map[string]map[string]bool{},
-		lock:           &sync.RWMutex{},
-		logger:         log.New(os.Stdout, "pusher: ", 0),
+		heartbeat:          defaultHeartbeat,
+		heartbeatGracetime: defaultHeartbeatGracetime,
+		bufferSize:         defaultBufferSize,
+		sessionTimeout:     defaultSessionTimeout,
+		loglevel:           defaultLoglevel,
+		sessions:           map[string]*Session{},
+		subscriptions:      map[string]map[string]*Session{},
+		subscribers:        map[string]map[string]bool{},
+		lock:               &sync.RWMutex{},
+		logger:             log.New(os.Stdout, "pusher: ", 0),
 	}
+}
+
+type PusherSessionStats map[string]int
+type PusherStats struct {
+	Sessions      map[string]PusherSessionStats            `json:"sessions"`
+	Subscriptions map[string]map[string]PusherSessionStats `json:"subscriptions"`
+	Subscribers   []string                                 `json:"subscribers"`
+}
+
+func (self *Server) Stats() PusherStats {
+	stats := PusherStats{
+		Sessions:      map[string]PusherSessionStats{},
+		Subscriptions: map[string]map[string]PusherSessionStats{},
+		Subscribers:   []string{},
+	}
+	for k, session := range self.sessions {
+		stats.Sessions[k] = PusherSessionStats{}
+		stats.Sessions[k]["output"] = len(session.output)
+		stats.Sessions[k]["input"] = len(session.input)
+		stats.Sessions[k]["connections"] = int(session.connections)
+	}
+	for subscription := range self.subscriptions {
+		stats.Subscriptions[subscription] = map[string]PusherSessionStats{}
+		for k, session := range self.subscriptions[subscription] {
+			stats.Subscriptions[subscription][k] = PusherSessionStats{}
+			stats.Subscriptions[subscription][k]["output"] = len(session.output)
+			stats.Subscriptions[subscription][k]["input"] = len(session.input)
+			stats.Subscriptions[subscription][k]["connections"] = int(session.connections)
+		}
+	}
+	for subscriber := range self.subscribers {
+		stats.Subscribers = append(stats.Subscribers, subscriber)
+	}
+	return stats
 }
 
 func (self *Server) Loglevel(i int) *Server {
@@ -75,24 +113,24 @@ func (self *Server) Logger(l *log.Logger) *Server {
 }
 
 func (self *Server) Fatalf(fmt string, i ...interface{}) {
-	self.logger.Printf(fmt, i...)
+	self.logger.Printf("FATAL: "+fmt, i...)
 }
 
 func (self *Server) Errorf(fmt string, i ...interface{}) {
 	if self.loglevel > 0 {
-		self.logger.Printf(fmt, i...)
+		self.logger.Printf("ERROR: "+fmt, i...)
 	}
 }
 
 func (self *Server) Infof(fmt string, i ...interface{}) {
 	if self.loglevel > 1 {
-		self.logger.Printf(fmt, i...)
+		self.logger.Printf("INFO: "+fmt, i...)
 	}
 }
 
-func (self *Server) Debugf(fmt string, i ...interface{}) {
+func (self *Server) Debugf(f string, i ...interface{}) {
 	if self.loglevel > 2 {
-		self.logger.Printf(fmt, i...)
+		self.logger.Printf("DEBUG: "+f, i...)
 	}
 }
 
@@ -156,6 +194,15 @@ func (self *Server) randomId() string {
 	return (base64.URLEncoding.EncodeToString(buf))
 }
 
+func (self *Server) Close() {
+	self.lock.Lock()
+	defer self.lock.Unlock()
+
+	for _, sess := range self.sessions {
+		close(sess.input)
+	}
+}
+
 func (self *Server) removeSession(id string) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
@@ -176,6 +223,7 @@ func (self *Server) GetSession(id string) (result *Session) {
 	if result = self.sessions[id]; result == nil {
 		result = &Session{
 			output:         make(chan Message, self.bufferSize),
+			input:          make(chan Message),
 			id:             self.randomId(),
 			server:         self,
 			authorizations: map[string]bool{},
@@ -213,9 +261,10 @@ const (
 )
 
 type Welcome struct {
-	Heartbeat      time.Duration
-	SessionTimeout time.Duration
-	Id             string
+	Heartbeat          time.Duration
+	HeartbeatGracetime time.Duration
+	SessionTimeout     time.Duration
+	Id                 string
 }
 
 type Error struct {
@@ -235,13 +284,12 @@ type Message struct {
 }
 
 type Session struct {
-	ws             io.ReadWriteCloser
 	id             string
 	RemoteAddr     string
 	input          chan Message
 	output         chan Message
-	closing        chan struct{}
 	server         *Server
+	connections    int32
 	cleanupTimer   *time.Timer
 	authorizations map[string]bool
 	lock           *sync.RWMutex
@@ -252,60 +300,61 @@ func (self *Session) parseMessage(b []byte) (result Message, err error) {
 	return
 }
 
-func (self *Session) readLoop() {
-	defer self.terminate()
-	buf := make([]byte, bufLength)
-	n, err := self.ws.Read(buf)
-	for err == nil {
-		if message, err := self.parseMessage(buf[:n]); err == nil {
-			self.input <- message
-			self.server.Debugf("%v\t%v\t%v\t%v\t[received from socket]", time.Now(), message.URI, self.RemoteAddr, self.id)
-		} else {
-			self.send(Message{
-				Type: TypeError,
-				Error: &Error{
-					Message: err.Error(),
-					Type:    TypeJSONError,
-				},
-				Data: string(buf[:n]),
-			})
-		}
-		n, err = self.ws.Read(buf)
+type MessagePipe interface {
+	Close() error
+	ReceiveMessage() (*Message, error)
+	SendMessage(*Message) error
+}
+
+type wsWrapper struct {
+	*websocket.Conn
+}
+
+func (self *wsWrapper) ReceiveMessage() (result *Message, err error) {
+	result = &Message{}
+	err = websocket.JSON.Receive(self.Conn, result)
+	return
+}
+
+func (self *wsWrapper) SendMessage(m *Message) (err error) {
+	err = websocket.JSON.Send(self.Conn, m)
+	return
+}
+func (self *Session) readLoop(closing chan struct{}, ws MessagePipe) {
+	defer self.kill(closing)
+	var err error
+	var message *Message
+	for message, err = ws.ReceiveMessage(); err == nil; message, err = ws.ReceiveMessage() {
+		self.input <- *message
+		self.server.Debugf("%v\t%v\t%v\t%v\t%v\t[received from socket]", time.Now(), message.Type, message.URI, self.RemoteAddr, self.id)
+	}
+	if err != nil && err != io.EOF {
+		self.server.Errorf("%v\t%v\t%v\t[%v]", time.Now(), self.RemoteAddr, self.id, err)
 	}
 }
 
-func (self *Session) writeLoop() {
-	defer self.terminate()
+func (self *Session) writeLoop(closing chan struct{}, ws MessagePipe) {
+	defer self.kill(closing)
 	var message Message
 	var err error
-	var n int
-	var encoded []byte
 	for {
 		select {
 		case message = <-self.output:
-			if encoded, err = json.Marshal(message); err == nil {
-				if n, err = self.ws.Write(encoded); err != nil {
-					self.server.Fatalf("Error sending %s on %+v: %v", encoded, self.ws, err)
-					return
-				} else if n != len(encoded) {
-					self.server.Fatalf("Unable to send all of %s on %+v: only sent %v bytes", encoded, self.ws, n)
-					return
-				}
-			} else {
-				self.server.Fatalf("Unable to JSON marshal %+v: %v", message, err)
+			if err = ws.SendMessage(&message); err != nil {
+				self.server.Fatalf("Error sending %v on %+v: %v", message, ws, err)
 				return
 			}
-			self.server.Debugf("%v\t%v\t%v\t%v\t[sent to socket]", time.Now(), message.URI, self.RemoteAddr, self.id)
-		case <-self.closing:
+			self.server.Debugf("%v\t%v\t%v\t%v\t%v\t[sent to socket]", time.Now(), message.Type, message.URI, self.RemoteAddr, self.id)
+		case <-closing:
 			return
 		}
 	}
 }
 
-func (self *Session) heartbeatLoop() {
+func (self *Session) heartbeatLoop(closing chan struct{}) {
 	for {
 		select {
-		case <-self.closing:
+		case <-closing:
 			return
 		case <-time.After(self.server.heartbeat / 2):
 			self.send(Message{Type: TypeHeartbeat})
@@ -339,6 +388,7 @@ func (self *Session) handleMessage(message Message) {
 	case TypeHeartbeat:
 	case TypeMessage:
 		if !self.authorized(message.URI, true) {
+			self.server.Debugf("%v\t%v\t%v\t[unauthorized emit]", time.Now(), message.URI, self.RemoteAddr)
 			self.send(Message{
 				Type: TypeError,
 				Id:   message.Id,
@@ -355,6 +405,7 @@ func (self *Session) handleMessage(message Message) {
 		self.server.removeSubscription(self.id, message.URI, true)
 	case TypeSubscribe:
 		if !self.authorized(message.URI, false) {
+			self.server.Debugf("%v\t%v\t%v\t[unauthorized subscribe]", time.Now(), message.URI, self.RemoteAddr)
 			self.send(Message{
 				Type: TypeError,
 				Id:   message.Id,
@@ -368,6 +419,7 @@ func (self *Session) handleMessage(message Message) {
 		}
 		self.server.addSubscription(self, message.URI)
 	case TypeAuthorize:
+		self.server.Debugf("%v\t%v\t%v\t[authorizing %#v/%v]", time.Now(), message.URI, self.RemoteAddr, message.Token, message.Write)
 		if self.server.authorizer != nil {
 			ok, err := self.server.authorizer(message.URI, message.Token, message.Write)
 			if err != nil {
@@ -422,60 +474,80 @@ func (self *Session) remove() {
 	self.server.removeSession(self.id)
 }
 
-func (self *Session) terminate() {
-	self.ws.Close()
-	select {
-	case _ = <-self.closing:
-	default:
-		close(self.closing)
-	}
-	self.server.Infof("%v\t-\t[disconnect]\t%v\t%v", time.Now(), self.RemoteAddr, self.id)
+func (self *Session) kill(closing chan struct{}) {
+
 	self.lock.Lock()
 	defer self.lock.Unlock()
+
+	select {
+	case _ = <-closing:
+	default:
+		close(closing)
+	}
+}
+func (self *Session) terminate(closing chan struct{}, ws MessagePipe) {
+	self.lock.Lock()
+	defer self.lock.Unlock()
+
+	select {
+	case _ = <-closing:
+	default:
+		close(closing)
+	}
+
+	self.server.Infof("%v\t-\t[disconnect]\t%v\t%v", time.Now(), self.RemoteAddr, self.id)
+
+	ws.Close()
 	self.cleanupTimer.Stop()
-	self.cleanupTimer = time.AfterFunc(self.server.sessionTimeout, self.remove)
+	if atomic.AddInt32(&self.connections, -1) == 0 {
+		self.cleanupTimer = time.AfterFunc(self.server.sessionTimeout, self.remove)
+	}
 }
 
 func (self *Session) handleWS(ws *websocket.Conn) {
 	self.RemoteAddr = ws.Request().RemoteAddr
-	self.Handle(ws)
+	self.Handle(&wsWrapper{ws})
 }
 
 /*
- * This function will work as the session main-loop listening on events
- * on a websocket or other source that interfaces io.ReadWriteCloser.
+ * Handle works as the session main-loop listening on events
+ * on a websocket or other source that implements io.ReadWriteCloser.
  */
-func (self *Session) Handle(ws io.ReadWriteCloser) {
+func (self *Session) Handle(ws MessagePipe) {
 	self.server.Infof("%v\t-\t[connect]\t%v\t%v", time.Now(), self.RemoteAddr, self.id)
 
-	defer self.terminate()
+	closing := make(chan struct{})
+	defer self.terminate(closing, ws)
+	atomic.AddInt32(&self.connections, 1)
 
-	self.ws = ws
 	self.cleanupTimer.Stop()
-	self.input = make(chan Message)
-	self.closing = make(chan struct{})
 
-	go self.readLoop()
-	go self.writeLoop()
-	go self.heartbeatLoop()
+	go self.readLoop(closing, ws)
+	go self.writeLoop(closing, ws)
+	go self.heartbeatLoop(closing)
 
 	self.send(Message{
 		Type: TypeWelcome,
 		Welcome: &Welcome{
-			Heartbeat:      self.server.heartbeat / time.Millisecond,
-			SessionTimeout: self.server.sessionTimeout / time.Millisecond,
-			Id:             self.id,
+			Heartbeat:          self.server.heartbeat / time.Millisecond,
+			HeartbeatGracetime: self.server.heartbeatGracetime / time.Millisecond,
+			SessionTimeout:     self.server.sessionTimeout / time.Millisecond,
+			Id:                 self.id,
 		},
 	})
 
 	var message Message
+	var ok bool
 	for {
 		select {
-		case _ = <-self.closing:
+		case _ = <-closing:
 			return
-		case message = <-self.input:
+		case message, ok = <-self.input:
+			if !ok {
+				return
+			}
 			self.handleMessage(message)
-		case <-time.After(self.server.heartbeat):
+		case <-time.After(self.server.heartbeat + self.server.heartbeatGracetime):
 			return
 		}
 	}

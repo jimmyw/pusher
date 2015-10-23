@@ -1,8 +1,9 @@
 package hub
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestHubRecive(t *testing.T) {
@@ -10,12 +11,12 @@ func TestHubRecive(t *testing.T) {
 	defer l.Close()
 
 	// Create new session using ws
-	send, recv := Connect("")
+	send, recv := Connect("", "http://localhost/2233", "ws://localhost:2233/")
 
 	// Expect an
 	input_welcome := recv.Next(TypeWelcome)
-	assert.Equal(t, input_welcome.Welcome.Heartbeat, 5000, "Expected a hartbeat setting")
-	assert.Equal(t, input_welcome.Welcome.SessionTimeout, 30000, "Expected a hartbeat setting")
+	assert.Equal(t, input_welcome.Welcome.Heartbeat, 60000, "Expected a heartbeat setting")
+	assert.Equal(t, input_welcome.Welcome.SessionTimeout, 180000, "Expected a heartbeat setting")
 
 	send <- Message{
 		Type: TypeSubscribe,
@@ -44,8 +45,8 @@ func TestHubReciveInternal(t *testing.T) {
 
 	// Expect an
 	input_welcome := recv.Next(TypeWelcome)
-	assert.Equal(t, input_welcome.Welcome.Heartbeat, 5000, "Expected a hartbeat setting")
-	assert.Equal(t, input_welcome.Welcome.SessionTimeout, 30000, "Expected a hartbeat setting")
+	assert.NotEqual(t, input_welcome.Welcome.Heartbeat, 0, "Expected a heartbeat setting")
+	assert.NotEqual(t, input_welcome.Welcome.SessionTimeout, 0, "Expected a heartbeat setting")
 
 	send <- Message{
 		Type: TypeSubscribe,
@@ -62,5 +63,5 @@ func TestHubReciveInternal(t *testing.T) {
 	})
 
 	message := recv.Next(TypeMessage)
-	assert.Equal(t, message.Data, []interface{}{"Hello world"}, "Expected hello world")
+	assert.Equal(t, message.Data, []string{"Hello world"}, "Expected hello world")
 }
